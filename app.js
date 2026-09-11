@@ -51,7 +51,7 @@ const state = {
   audio: null,
   lastDrawCount: 0,
   lastBingoCount: 0,
-  announcedFinishers: new Set(),
+  announcedFinishers: new Map(),
   finishAnnouncement: null,
   finishAnnouncementTimer: null
 };
@@ -325,6 +325,11 @@ function connectRoom() {
     if (!snapshot.exists()) { toast("이 방은 더 이상 존재하지 않아요."); leaveRoom(); return; }
     const previous = state.room;
     state.room = snapshot.val();
+    if (previous?.settings?.status === "playing" && state.room.settings?.status === "setup") {
+      state.announcedFinishers.clear();
+      clearTimeout(state.finishAnnouncementTimer);
+      state.finishAnnouncement = null;
+    }
     if (state.role === "student" && state.playerId && state.room.players?.[state.playerId]) {
       localStorage.setItem(`bingo_state_${state.roomCode}_${state.playerId}`, JSON.stringify(state.room.players[state.playerId]));
     }
@@ -362,17 +367,53 @@ function currentDraw() { const ids = drawnIds(); return roomImages().find(image 
 function updateFinishAnnouncements(previous) {
   const finishedNow = roomPlayers().filter(p => p.finishedAt);
   if (!previous) {
-    finishedNow.forEach(p => state.announcedFinishers.add(p.id));
+    finishedNow.forEach(p => state.announcedFinishers.set(p.id, p.bingoCount || 0));
     return;
   }
-  const fresh = finishedNow.filter(p => !state.announcedFinishers.has(p.id));
+  const fresh = finishedNow.filter(p => (state.announcedFinishers.get(p.id) ?? -1) < (p.bingoCount || 0));
   if (!fresh.length) return;
-  fresh.forEach(p => state.announcedFinishers.add(p.id));
+  fresh.forEach(p => state.announcedFinishers.set(p.id, p.bingoCount || 0));
   state.finishAnnouncement = fresh.length > 1
     ? `${fresh.map(p => p.name).join(", ")}님들`
     : `${fresh[0].name}님`;
   clearTimeout(state.finishAnnouncementTimer);
   state.finishAnnouncementTimer = setTimeout(() => { state.finishAnnouncement = null; render(); }, 4200);
+}
+
+async function continueToNextTarget() {
+  const settings = state.room.settings;
+  const newTarget = (settings.target || 1) + 1;
+  if (newTarget > 3) return;
+  const changes = { [`rooms/${state.roomCode}/settings/target`]: newTarget };
+  for (const player of roomPlayers()) {
+    const bingoCount = player.bingoCount || 0;
+    changes[`rooms/${state.roomCode}/players/${player.id}/finishedAt`] = bingoCount >= newTarget ? (player.finishedAt || serverTimestamp()) : null;
+  }
+  await update(ref(db), changes);
+  tone("join");
+  toast(`목표를 ${newTarget}빙고로 올려서 계속해요.`);
+}
+
+function showRestartConfirm() {
+  showModal(`<h2>처음부터 다시 시작할까요?</h2><p class="subtle">같은 방과 같은 이미지는 그대로 두고, 학생들의 빙고판·체크 표시·완성 기록만 초기화돼요. 학생들은 그 자리에서 새로 빙고판을 만들게 됩니다.</p>
+    <div class="modal-actions"><button class="btn ghost" data-action="close-modal">취소</button><button class="btn danger" data-action="confirm-restart-game">처음부터 다시 시작</button></div>`);
+}
+
+async function restartGame() {
+  const changes = {
+    [`rooms/${state.roomCode}/settings/status`]: "setup",
+    [`rooms/${state.roomCode}/drawn`]: null
+  };
+  for (const player of roomPlayers()) {
+    changes[`rooms/${state.roomCode}/players/${player.id}/board`] = null;
+    changes[`rooms/${state.roomCode}/players/${player.id}/marks`] = null;
+    changes[`rooms/${state.roomCode}/players/${player.id}/bingoCount`] = 0;
+    changes[`rooms/${state.roomCode}/players/${player.id}/finishedAt`] = null;
+  }
+  await update(ref(db), changes);
+  closeModal();
+  tone("join");
+  toast("게임을 처음부터 다시 시작해요.");
 }
 
 function teacherView() {
@@ -395,7 +436,11 @@ function teacherView() {
         <div class="field"><label for="teacherSize">빙고판 크기</label><select id="teacherSize" ${setup ? "" : "disabled"}><option value="3" ${settings.size===3?"selected":""}>3 × 3</option><option value="4" ${settings.size===4?"selected":""}>4 × 4</option><option value="5" ${settings.size===5?"selected":""}>5 × 5</option></select></div>
         <div class="field"><label for="teacherTarget">승리 조건</label><select id="teacherTarget" ${setup ? "" : "disabled"}><option value="1" ${settings.target===1?"selected":""}>1빙고</option><option value="2" ${settings.target===2?"selected":""}>2빙고</option><option value="3" ${settings.target===3?"selected":""}>3빙고</option></select></div>
       </div>
-      ${setup ? `<p class="setup-note">이미지는 최소 ${needed}장 필요해요. 현재 <strong>${images.length}장</strong> 준비됐습니다.</p>` : `<p class="setup-note">게임이 시작되어 설정이 잠겼어요. 현재 ${settings.size}×${settings.size}, ${settings.target}빙고입니다.</p>`}
+      ${setup ? `<p class="setup-note">이미지는 최소 ${needed}장 필요해요. 현재 <strong>${images.length}장</strong> 준비됐습니다.</p>` : `<p class="setup-note">게임이 시작되어 설정이 잠겼어요. 현재 ${settings.size}×${settings.size}, ${settings.target}빙고입니다.</p>
+      <div class="toolbar" style="margin-top:12px">
+        ${settings.target < 3 ? `<button type="button" class="btn ghost small" data-action="continue-target">${settings.target + 1}빙고로 올려서 계속하기</button>` : ""}
+        <button type="button" class="btn danger small" data-action="restart-game">처음부터 다시 시작</button>
+      </div>`}
     </article>
 
     <article class="card"><div class="card-head"><h3>참여 학생</h3><span class="status-pill">${players.filter(p=>p.online).length}명 접속</span></div>
@@ -867,7 +912,7 @@ function leaveRoom() {
   state.playerId = "";
   state.playerName = "";
   state.selectedCell = null;
-  state.announcedFinishers = new Set();
+  state.announcedFinishers = new Map();
   clearTimeout(state.finishAnnouncementTimer);
   state.finishAnnouncement = null;
   state.view = "welcome";
@@ -899,6 +944,9 @@ document.addEventListener("click", async event => {
   if (action === "start-game") await startGame();
   if (action === "delete-image") await deleteImage(button.dataset.id);
   if (action === "mark-called-image") await markCalledImage(button.dataset.id);
+  if (action === "continue-target") await continueToNextTarget();
+  if (action === "restart-game") showRestartConfirm();
+  if (action === "confirm-restart-game") await restartGame();
   if (action === "show-qr") showQr();
   if (action === "copy-student-link") { await navigator.clipboard.writeText(button.dataset.url); tone("click"); toast("학생용 링크를 복사했어요."); }
   if (action === "leave-room" || action === "home") leaveRoom();
