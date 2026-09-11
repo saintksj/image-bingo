@@ -50,7 +50,10 @@ const state = {
   unsubRoom: null,
   audio: null,
   lastDrawCount: 0,
-  lastBingoCount: 0
+  lastBingoCount: 0,
+  announcedFinishers: new Set(),
+  finishAnnouncement: null,
+  finishAnnouncementTimer: null
 };
 
 const icons = {
@@ -331,6 +334,7 @@ function connectRoom() {
     const myBingo = state.room.players?.[state.playerId]?.bingoCount || 0;
     if (myBingo > state.lastBingoCount && state.role === "student") tone("bingo");
     state.lastBingoCount = myBingo;
+    if (state.role === "student") updateFinishAnnouncements(previous);
     render();
   });
 }
@@ -354,6 +358,22 @@ function roomImages() { return Object.values(state.room?.images || {}).sort((a, 
 function roomPlayers() { return Object.entries(state.room?.players || {}).map(([id, value]) => ({ id, ...value })).sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0)); }
 function drawnIds() { return (state.room?.drawn || []).filter(Boolean); }
 function currentDraw() { const ids = drawnIds(); return roomImages().find(image => image.id === ids.at(-1)); }
+
+function updateFinishAnnouncements(previous) {
+  const finishedNow = roomPlayers().filter(p => p.finishedAt);
+  if (!previous) {
+    finishedNow.forEach(p => state.announcedFinishers.add(p.id));
+    return;
+  }
+  const fresh = finishedNow.filter(p => !state.announcedFinishers.has(p.id));
+  if (!fresh.length) return;
+  fresh.forEach(p => state.announcedFinishers.add(p.id));
+  state.finishAnnouncement = fresh.length > 1
+    ? `${fresh.map(p => p.name).join(", ")}님들`
+    : `${fresh[0].name}님`;
+  clearTimeout(state.finishAnnouncementTimer);
+  state.finishAnnouncementTimer = setTimeout(() => { state.finishAnnouncement = null; render(); }, 4200);
+}
 
 function teacherView() {
   const settings = state.room?.settings || { size: 3, target: 1, status: "setup" };
@@ -389,7 +409,7 @@ function teacherView() {
       ${state.uploading ? `<div class="progress-track"><div class="progress-bar" style="width:${state.uploadProgress}%"></div></div>` : ""}
     </article>` : ""}
 
-    <article class="card"><div class="card-head"><div><h2>전체 이미지</h2><p class="subtle">${setup ? "삭제할 이미지를 누르세요. 학생이 선택한 이미지는 빨간 테두리로 표시됩니다." : "이미지를 누르면 모든 학생의 같은 칸에 빨간 동그라미가 표시됩니다."}</p></div><span class="status-pill">${setup ? `${images.length}장` : `${called.length} / ${images.length} 표시`}</span></div>
+    <article class="card"><div class="card-head"><div><h2>전체 이미지</h2><p class="subtle">${setup ? "삭제할 이미지를 누르세요. 학생이 선택한 이미지는 빨간 테두리로 표시됩니다." : "이미지를 누르면 학생 화면에 '지금 나온 이미지'로 표시돼요. 체크는 학생이 직접 합니다."}</p></div><span class="status-pill">${setup ? `${images.length}장` : `${called.length} / ${images.length} 표시`}</span></div>
       ${images.length ? `<div class="image-bank teacher-bank">${images.map((image,i)=> {
         const selectedCount = selectedCounts[image.id] || 0;
         const selectedClass = selectedCount ? "student-chosen" : "";
@@ -398,7 +418,7 @@ function teacherView() {
           ? `<button type="button" class="bank-item ${selectedClass}" data-action="delete-image" data-id="${escapeHTML(image.id)}" aria-label="${i+1}번 이미지 삭제"><img src="${escapeHTML(image.url)}" alt="업로드 이미지 ${i+1}">${badge}<span class="delete-mark" aria-hidden="true">×</span></button>`
           : `<button type="button" class="bank-item ${selectedClass} ${called.includes(image.id)?"called":""}" data-action="mark-called-image" data-id="${escapeHTML(image.id)}" aria-pressed="${called.includes(image.id)}" aria-label="${i+1}번 이미지 ${called.includes(image.id)?"표시 해제":"표시"}"><img src="${escapeHTML(image.url)}" alt="업로드 이미지 ${i+1}">${badge}</button>`;
       }).join("")}</div>` : `<div class="empty-state">업로드한 이미지가 여기에 모두 표시됩니다.</div>`}
-      ${!setup ? `<p class="setup-note">잘못 눌렀다면 같은 이미지를 다시 눌러 빨간 동그라미를 해제할 수 있어요.</p>` : ""}
+      ${!setup ? `<p class="setup-note">잘못 눌렀다면 같은 이미지를 다시 눌러 호출을 취소할 수 있어요.</p>` : ""}
     </article>
 
     ${setup ? `<button class="btn mint" style="min-height:58px;font-size:1.05rem" data-action="start-game" ${!ready || players.length===0 ? "disabled" : ""}>${icons.play} 학생 ${players.length}명과 게임 시작</button>` : ""}
@@ -423,21 +443,26 @@ function studentView() {
   const board = normalizeBoard(player.board, total);
   const filled = board.filter(Boolean).length;
   const called = drawnIds();
-  const marks = Object.fromEntries(called.map(id => [id,true]));
-  const ranks = roomPlayers().filter(p=>p.finishedAt).sort((a,b)=>a.finishedAt-b.finishedAt).slice(0,3);
+  const marks = player.marks || {};
   const setup = settings.status === "setup";
   const winner = (player.bingoCount || 0) >= settings.target;
-  return shell(`<div class="student-dashboard"><section class="student-workspace">
+  const draw = currentDraw();
+  const availableImages = images.filter(image => !board.includes(image.id));
+  return shell(`<div class="student-dashboard">
+    ${state.finishAnnouncement ? `<div class="winner-banner"><strong>🎉 ${escapeHTML(state.finishAnnouncement)} 빙고 완성!</strong><span>축하해주세요!</span></div>` : ""}
+    <section class="student-workspace">
     <article class="card student-board-card"><div class="card-head"><div><p class="eyebrow">학생 모드 · ${escapeHTML(state.playerName)}</p><h2>${setup ? "나만의 빙고판 만들기" : `${settings.target}빙고에 도전!`}</h2></div><span class="status-pill">${settings.size} × ${settings.size}</span></div>
-      ${winner ? `<div class="winner-banner"><strong>🎉 빙고 완성!</strong><span>축하해요! 순위표를 확인해 보세요.</span></div>` : ""}
-      ${setup ? `<p class="notice">이미지를 누르면 빈칸에 순서대로 들어가요. 빈칸을 먼저 누르면 그 자리에 들어갑니다. 모두 채운 뒤에는 두 칸을 눌러 자리를 바꾸거나, 한 칸과 보관함 이미지를 차례로 눌러 교체할 수 있어요.</p>` : `<p class="notice">강사가 선택한 이미지만 빨간 동그라미로 자동 표시돼요. 학생이 직접 누를 수는 없어요.</p>`}
-      <div class="board-wrap" style="margin-top:18px"><div class="bingo-board ${winner ? "bingo-flash" : ""}" style="grid-template-columns:repeat(${settings.size},1fr)">${board.map((id,index)=>boardCell(id,index,images,marks,setup)).join("")}</div></div>
+      ${setup
+        ? `<p class="notice">이미지를 누르면 빈칸에 순서대로 들어가요. 빈칸을 먼저 누르면 그 자리에 들어갑니다. 모두 채운 뒤에는 두 칸을 눌러 자리를 바꾸거나, 한 칸과 보관함 이미지를 차례로 눌러 교체할 수 있어요.</p>`
+        : `<p class="notice">나온 이미지를 내 빙고판에서 찾아 눌러서 체크하세요.</p>
+      <div class="draw-stage"><div class="draw-frame">${draw ? `<img src="${escapeHTML(draw.url)}" alt="지금 나온 이미지" class="draw-image">` : `<div class="draw-placeholder">아직 아무 이미지도<br>안 나왔어요</div>`}</div><div class="draw-copy"><span class="draw-count">${called.length}개 나옴</span><h3>${draw ? "지금 나온 이미지!" : "곧 시작해요"}</h3><p class="subtle">내 빙고판에 있으면 그 칸을 눌러 체크하세요.</p></div></div>`}
+      <div class="board-wrap" style="margin-top:18px"><div class="bingo-board ${winner ? "bingo-flash" : ""}" style="grid-template-columns:repeat(${settings.size},1fr)">${board.map((id,index)=>boardCell(id,index,images,marks)).join("")}</div></div>
       <p class="subtle" style="text-align:center;margin:16px 0 0">${setup ? `${filled}/${total}칸 채움${filled===total ? " · 두 칸은 자리 바꿈, 칸+보관함 이미지는 교체" : ""}` : `${player.bingoCount || 0}빙고 · 목표 ${settings.target}빙고`}</p>
     </article>
-    ${setup ? `<article class="card student-bank-card"><div class="card-head"><div><h2>이미지 보관함</h2><p class="subtle">${images.length < total ? `강사가 이미지를 준비 중이에요 (${images.length}/${total})` : "오른쪽 빙고판에 넣을 이미지를 선택하세요."}</p></div></div>
-      ${images.length ? `<div class="image-bank">${images.map((image,i)=>{const pos=board.indexOf(image.id);return `<button class="bank-item ${pos>=0?"used":""}" data-action="pick-image" data-id="${escapeHTML(image.id)}" ${pos>=0?"disabled":""}><img src="${escapeHTML(image.url)}" alt="빙고 이미지 ${i+1}">${pos>=0?`<span class="order-badge">${pos+1}</span>`:""}</button>`}).join("")}</div>` : `<div class="empty-state">강사가 이미지를 올리면<br>여기에 바로 나타납니다.</div>`}
-    </article>` : `<article class="card student-bank-card"><div class="card-head"><div><h2>전체 이미지</h2><p class="subtle">강사가 누른 이미지는 빨간 동그라미로 표시돼요.</p></div><span class="status-pill">${called.length} / ${images.length}</span></div><div class="image-bank">${images.map((image,i)=>`<div class="bank-item ${called.includes(image.id)?"called":""}"><img src="${escapeHTML(image.url)}" alt="전체 이미지 ${i+1}"></div>`).join("")}</div></article>`}
-  </section><article class="card student-rank-card"><div class="card-head"><h3>현재 순위</h3><span class="subtle">TOP 3</span></div><div class="rank-list">${ranks.length?ranks.map((p,i)=>rankRow(p,i)).join(""):`<div class="empty-state">아직 완성한 친구가 없어요.</div>`}</div></article></div>`);
+    ${setup ? `<article class="card student-bank-card"><div class="card-head"><div><h2>이미지 보관함</h2><p class="subtle">${images.length < total ? `강사가 이미지를 준비 중이에요 (${images.length}/${total})` : "빙고판에 넣을 이미지를 선택하세요."}</p></div></div>
+      ${availableImages.length ? `<div class="image-bank">${availableImages.map((image,i)=>`<button class="bank-item" data-action="pick-image" data-id="${escapeHTML(image.id)}"><img src="${escapeHTML(image.url)}" alt="빙고 이미지 ${i+1}"></button>`).join("")}</div>` : images.length ? `<div class="empty-state">이미지를 모두 빙고판에 넣었어요!<br>선생님이 시작하시면 게임이 시작돼요.</div>` : `<div class="empty-state">강사가 이미지를 올리면<br>여기에 바로 나타납니다.</div>`}
+    </article>` : `<article class="card student-bank-card"><div class="card-head"><div><h2>전체 이미지</h2><p class="subtle">나온 이미지는 빨간 동그라미로 표시돼요.</p></div><span class="status-pill">${called.length} / ${images.length}</span></div><div class="image-bank">${images.map((image,i)=>`<div class="bank-item ${called.includes(image.id)?"called":""}"><img src="${escapeHTML(image.url)}" alt="전체 이미지 ${i+1}"></div>`).join("")}</div></article>`}
+  </section></div>`);
 }
 
 function normalizeBoard(board, total) {
@@ -446,9 +471,9 @@ function normalizeBoard(board, total) {
   return result.slice(0, total);
 }
 
-function boardCell(id, index, images, marks, setup) {
+function boardCell(id, index, images, marks) {
   const image = images.find(item => item.id === id);
-  return `<button class="board-cell ${image ? "" : "empty"} ${state.selectedCell===index?"selected":""} ${marks[id]?"marked":""}" ${setup ? `data-action="board-cell" data-index="${index}"` : "disabled"} aria-label="${image ? `빙고 이미지 ${index+1}` : `빈칸 ${index+1}`}">${image ? `<img src="${escapeHTML(image.url)}" alt="">` : index+1}</button>`;
+  return `<button class="board-cell ${image ? "" : "empty"} ${state.selectedCell===index?"selected":""} ${marks[id]?"marked":""}" ${image ? `data-action="board-cell" data-index="${index}"` : "disabled"} aria-label="${image ? `빙고 이미지 ${index+1}` : `빈칸 ${index+1}`}">${image ? `<img src="${escapeHTML(image.url)}" alt="">` : index+1}</button>`;
 }
 
 async function updateBoard(board) {
@@ -492,6 +517,20 @@ async function clickBoard(index) {
     tone("click");
     await updateBoard(board);
     return;
+  }
+  if (settings.status === "playing") {
+    const id = board[index];
+    if (!id) return;
+    if (!drawnIds().includes(id)) return toast("아직 안 나온 이미지예요.");
+    const marks = { ...(player?.marks || {}) };
+    if (marks[id]) delete marks[id]; else marks[id] = true;
+    const bingoCount = calculateBingos(board, marks, settings.size);
+    tone("click");
+    await update(ref(db, `rooms/${state.roomCode}/players/${state.playerId}`), {
+      marks: Object.keys(marks).length ? marks : null,
+      bingoCount,
+      finishedAt: bingoCount >= settings.target ? (player?.finishedAt || serverTimestamp()) : null
+    });
   }
 }
 
@@ -805,17 +844,7 @@ async function markCalledImage(id) {
   if (settings.status !== "playing") return;
   const called = drawnIds();
   const nextCalled = called.includes(id) ? called.filter(item=>item!==id) : [...called,id];
-  const now = Date.now();
-  const changes = { [`rooms/${state.roomCode}/drawn`]: nextCalled.length ? nextCalled : null };
-  for (const player of roomPlayers()) {
-    const board = normalizeBoard(player.board, settings.size ** 2);
-    const marks = Object.fromEntries(nextCalled.filter(imageId=>board.includes(imageId)).map(imageId=>[imageId,true]));
-    const bingoCount = calculateBingos(board,marks,settings.size);
-    changes[`rooms/${state.roomCode}/players/${player.id}/marks`] = Object.keys(marks).length ? marks : null;
-    changes[`rooms/${state.roomCode}/players/${player.id}/bingoCount`] = bingoCount;
-    changes[`rooms/${state.roomCode}/players/${player.id}/finishedAt`] = bingoCount >= settings.target ? (player.finishedAt || now) : null;
-  }
-  await update(ref(db),changes);
+  await update(ref(db, `rooms/${state.roomCode}`), { drawn: nextCalled.length ? nextCalled : null });
   tone("draw");
 }
 
@@ -838,6 +867,9 @@ function leaveRoom() {
   state.playerId = "";
   state.playerName = "";
   state.selectedCell = null;
+  state.announcedFinishers = new Set();
+  clearTimeout(state.finishAnnouncementTimer);
+  state.finishAnnouncement = null;
   state.view = "welcome";
   history.replaceState({}, "", location.pathname);
   renderWelcome();
