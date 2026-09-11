@@ -1,6 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import { getDatabase, ref, set, update, onValue, get, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
 import { getStorage, ref as storageRef, uploadBytesResumable, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-storage.js";
+import { getAuth, onAuthStateChanged, signInAnonymously, signInWithEmailAndPassword, updatePassword, reauthenticateWithCredential, EmailAuthProvider } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCHy_PesFeDukcR8EoApvNiSybHaTXzTQo",
@@ -15,9 +16,21 @@ const firebaseConfig = {
 const firebase = initializeApp(firebaseConfig);
 const db = getDatabase(firebase);
 const storage = getStorage(firebase);
+const auth = getAuth(firebase);
 const app = document.querySelector("#app");
 const toastEl = document.querySelector("#toast");
-const DEFAULT_TEACHER_PASSWORD = "4312";
+// Firebase 콘솔 > Authentication > Users 에 이 이메일로 강사 계정을 1개 만들어 두어야 합니다.
+const TEACHER_EMAIL = "teacher@image-bingo.app";
+
+let resolveAuthReady;
+const authReady = new Promise(resolve => { resolveAuthReady = resolve; });
+onAuthStateChanged(auth, async user => {
+  if (!user) {
+    try { await signInAnonymously(auth); } catch (error) { console.error(error); }
+    return;
+  }
+  resolveAuthReady(user);
+});
 
 const state = {
   view: "welcome",
@@ -59,18 +72,24 @@ function makeId(prefix = "id") {
 }
 
 function makeRoomCode() {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  return Array.from({ length: 6 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+  return String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
 }
 
 function cleanCode(code) {
-  return String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+  return String(code || "").replace(/[^0-9]/g, "").slice(0, 6);
 }
 
-async function hashPassword(value) {
-  const bytes = new TextEncoder().encode(String(value));
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+async function roomCodeExists(code) {
+  const snapshot = await get(ref(db, `rooms/${code}`));
+  return snapshot.exists();
+}
+
+async function makeUniqueRoomCode() {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const code = makeRoomCode();
+    if (!(await roomCodeExists(code))) return code;
+  }
+  throw new Error("ROOM_CODE_EXHAUSTED");
 }
 
 function toast(message) {
@@ -148,46 +167,55 @@ async function verifyTeacherPassword() {
   if (!entered) return toast("비밀번호를 입력해 주세요.");
   if (button) { button.disabled = true; button.textContent = "확인 중…"; }
   try {
-    const snapshot = await get(ref(db, "appSettings/teacherPasswordHash"));
-    const expectedHash = String(snapshot.val() || await hashPassword(DEFAULT_TEACHER_PASSWORD));
-    if (await hashPassword(entered) !== expectedHash) {
-      toast("비밀번호가 맞지 않아요.");
-      if (button) { button.disabled = false; button.textContent = "다시 확인"; }
-      input?.select();
-      return;
-    }
+    await signInWithEmailAndPassword(auth, TEACHER_EMAIL, entered);
     closeModal();
     showTeacherModal();
   } catch (error) {
     console.error(error);
-    toast("비밀번호를 확인하지 못했어요. 연결 상태를 확인해 주세요.");
-    if (button) { button.disabled = false; button.textContent = "다시 시도"; }
+    const code = String(error?.code || "");
+    const message = code.includes("network")
+      ? "연결이 원활하지 않아요. 인터넷 상태를 확인한 뒤 다시 시도해 주세요."
+      : code.includes("too-many-requests")
+        ? "시도 횟수가 많아 잠시 막혔어요. 잠시 후 다시 시도해 주세요."
+        : "비밀번호가 맞지 않아요.";
+    toast(message);
+    if (button) { button.disabled = false; button.textContent = "다시 확인"; }
+    input?.select();
   }
 }
 
 function showChangePasswordModal() {
-  showModal(`<h2>강사 비밀번호 변경</h2><p class="subtle">모든 기기에서 사용할 새 비밀번호를 설정하세요.</p>
-    <div class="field"><label for="newTeacherPassword">새 비밀번호</label><input id="newTeacherPassword" type="password" inputmode="numeric" maxlength="12" placeholder="숫자 4~12자리" autocomplete="new-password"></div>
+  showModal(`<h2>강사 비밀번호 변경</h2><p class="subtle">현재 비밀번호를 확인한 뒤 새 비밀번호로 바꿀 수 있어요.</p>
+    <div class="field"><label for="currentTeacherPassword">현재 비밀번호</label><input id="currentTeacherPassword" type="password" inputmode="numeric" maxlength="12" placeholder="현재 비밀번호" autocomplete="current-password"></div>
+    <div class="field" style="margin-top:12px"><label for="newTeacherPassword">새 비밀번호</label><input id="newTeacherPassword" type="password" inputmode="numeric" maxlength="12" placeholder="숫자 4~12자리" autocomplete="new-password"></div>
     <div class="field" style="margin-top:12px"><label for="confirmTeacherPassword">새 비밀번호 확인</label><input id="confirmTeacherPassword" type="password" inputmode="numeric" maxlength="12" placeholder="한 번 더 입력" autocomplete="new-password"></div>
     <div class="modal-actions"><button class="btn ghost" data-action="close-modal">취소</button><button class="btn primary" data-action="save-teacher-password">변경하기</button></div>`);
-  setTimeout(() => document.querySelector("#newTeacherPassword")?.focus(), 0);
+  setTimeout(() => document.querySelector("#currentTeacherPassword")?.focus(), 0);
 }
 
 async function saveTeacherPassword() {
+  const current = String(document.querySelector("#currentTeacherPassword")?.value || "");
   const next = String(document.querySelector("#newTeacherPassword")?.value || "");
-  const confirm = String(document.querySelector("#confirmTeacherPassword")?.value || "");
-  if (!/^\d{4,12}$/.test(next)) return toast("비밀번호는 숫자 4~12자리로 입력해 주세요.");
-  if (next !== confirm) return toast("새 비밀번호가 서로 다릅니다.");
+  const confirmValue = String(document.querySelector("#confirmTeacherPassword")?.value || "");
+  if (!current) return toast("현재 비밀번호를 입력해 주세요.");
+  if (!/^\d{4,12}$/.test(next)) return toast("새 비밀번호는 숫자 4~12자리로 입력해 주세요.");
+  if (next !== confirmValue) return toast("새 비밀번호가 서로 다릅니다.");
   const button = document.querySelector('[data-action="save-teacher-password"]');
   if (button) { button.disabled = true; button.textContent = "저장 중…"; }
   try {
-    await set(ref(db, "appSettings/teacherPasswordHash"), await hashPassword(next));
+    const credential = EmailAuthProvider.credential(TEACHER_EMAIL, current);
+    await reauthenticateWithCredential(auth.currentUser, credential);
+    await updatePassword(auth.currentUser, next);
     closeModal();
     tone("join");
     toast("강사 비밀번호를 변경했어요.");
   } catch (error) {
     console.error(error);
-    toast("비밀번호를 저장하지 못했어요. 다시 시도해 주세요.");
+    const code = String(error?.code || "");
+    const message = code.includes("credential") || code.includes("wrong-password")
+      ? "현재 비밀번호가 맞지 않아요."
+      : "비밀번호를 변경하지 못했어요. 다시 시도해 주세요.";
+    toast(message);
     if (button) { button.disabled = false; button.textContent = "다시 시도"; }
   }
 }
@@ -195,7 +223,7 @@ async function saveTeacherPassword() {
 function showStudentModal(prefill = "") {
   const remembered = prefill ? JSON.parse(localStorage.getItem(`bingo_student_${cleanCode(prefill)}`) || "null") : null;
   showModal(`<h2>빙고방 입장</h2><p class="subtle">강사 화면에 보이는 방 코드와 사용할 이름을 입력하세요.</p>
-    <div class="field"><label for="joinCode">방 코드</label><input id="joinCode" inputmode="text" maxlength="6" value="${escapeHTML(cleanCode(prefill))}" placeholder="예: AB12CD" autocomplete="off"></div>
+    <div class="field"><label for="joinCode">방 코드</label><input id="joinCode" inputmode="numeric" maxlength="6" value="${escapeHTML(cleanCode(prefill))}" placeholder="예: 482913" autocomplete="off"></div>
     <div class="field" style="margin-top:12px"><label for="studentName">이름</label><input id="studentName" maxlength="20" value="${escapeHTML(remembered?.name || "")}" placeholder="예: 김민지" autocomplete="name"></div>
     <div class="modal-actions"><button class="btn ghost" data-action="close-modal">취소</button><button class="btn sun" data-action="join-room">입장하기</button></div>`);
   setTimeout(() => document.querySelector(prefill ? "#studentName" : "#joinCode")?.focus(), 0);
@@ -212,14 +240,19 @@ async function createRoom() {
   if (state.creatingRoom) return;
   const size = Number(document.querySelector("#boardSize")?.value || 3);
   const target = Number(document.querySelector("#targetBingo")?.value || 1);
-  const code = makeRoomCode();
   const token = makeId("teacher");
   const button = document.querySelector('[data-action="create-room"]');
   const status = document.querySelector("#roomCreateStatus");
   state.creatingRoom = true;
   if (button) { button.disabled = true; button.textContent = "방 만드는 중…"; }
   if (status) { status.className = "modal-status waiting"; status.innerHTML = '<span class="spinner"></span>Firebase에 방을 저장하고 있어요'; }
+  let code;
   try {
+    await authReady;
+    code = await Promise.race([
+      makeUniqueRoomCode(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("CONNECTION_TIMEOUT")), 12000))
+    ]);
     await Promise.race([
       set(ref(db, `rooms/${code}`), {
         createdAt: Date.now(),
@@ -259,6 +292,7 @@ async function joinRoom(codeInput, nameInput) {
   const code = cleanCode(codeInput ?? document.querySelector("#joinCode")?.value);
   const name = String(nameInput ?? document.querySelector("#studentName")?.value ?? "").trim();
   if (code.length !== 6 || !name) return toast("방 코드와 이름을 모두 입력해 주세요.");
+  await authReady;
   const snapshot = await get(ref(db, `rooms/${code}`));
   if (!snapshot.exists()) return toast("방을 찾지 못했어요. 코드를 다시 확인해 주세요.");
   const saved = JSON.parse(localStorage.getItem(`bingo_student_${code}`) || "null");
@@ -473,7 +507,7 @@ function registerWebMcp() {
       inputSchema: {
         type: "object",
         properties: {
-          roomCode: { type: "string", pattern: "^[A-Za-z0-9]{6}$", description: "6자리 방 코드" },
+          roomCode: { type: "string", pattern: "^[0-9]{6}$", description: "6자리 숫자 방 코드" },
           studentName: { type: "string", minLength: 1, maxLength: 20, description: "학생 이름" }
         },
         required: ["roomCode", "studentName"],
@@ -858,11 +892,13 @@ window.addEventListener("beforeunload", () => {
 const queryRoom = cleanCode(new URLSearchParams(location.search).get("room"));
 const queryMode = new URLSearchParams(location.search).get("mode");
 renderWelcome();
-if (queryRoom && queryMode === "teacher" && localStorage.getItem(`bingo_teacher_${queryRoom}`)) {
-  state.roomCode = queryRoom;
-  state.role = "teacher";
-  state.teacherToken = localStorage.getItem(`bingo_teacher_${queryRoom}`);
-  state.view = "teacher";
-  connectRoom();
-} else if (queryRoom) showStudentModal(queryRoom);
+authReady.then(() => {
+  if (queryRoom && queryMode === "teacher" && localStorage.getItem(`bingo_teacher_${queryRoom}`)) {
+    state.roomCode = queryRoom;
+    state.role = "teacher";
+    state.teacherToken = localStorage.getItem(`bingo_teacher_${queryRoom}`);
+    state.view = "teacher";
+    connectRoom();
+  } else if (queryRoom) showStudentModal(queryRoom);
+});
 registerWebMcp();
